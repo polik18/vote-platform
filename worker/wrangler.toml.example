@@ -1,0 +1,14 @@
+name = "vote-platform-api"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+[vars]
+FIREBASE_PROJECT_ID = "YOUR_FIREBASE_PROJECT_ID"
+SUPER_ADMIN_EMAIL = "you@example.com"
+ALLOWED_ORIGINS = "http://localhost:5173,https://YOUR_GITHUB_USERNAME.github.io"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "vote-platform-db"
+database_id = "PASTE_D1_DATABASE_ID_HERE"
+migrations_dir = "migrations"

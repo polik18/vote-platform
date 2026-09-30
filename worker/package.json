@@ -1,0 +1,19 @@
+{
+  "name": "vote-platform-worker",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create vote-platform-db",
+    "db:migrate:local": "wrangler d1 migrations apply vote-platform-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply vote-platform-db --remote"
+  },
+  "dependencies": {
+    "jose": "^6.2.12"
+  },
+  "devDependencies": {
+    "wrangler": "^4.143.0"
+  }
+}
