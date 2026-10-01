@@ -35,17 +35,28 @@ function shell(content) {
   const role = state.me?.role;
   return `
   <div class="shell">
+    <a class="skip-link" href="#main">跳到主要內容</a>
     <header class="topbar">
-      <div class="brand">Vote Platform</div>
-      <div class="nav">
-        <button data-nav="/">首頁</button>
-        ${state.user ? `<button data-nav="/polls">投票</button>` : ''}
-        ${role==='admin'||role==='super_admin' ? `<button data-nav="/admin">管理</button>` : ''}
-        ${role==='super_admin' ? `<button data-nav="/admins">管理員</button>` : ''}
-        ${state.user ? `<span class="small muted">${esc(state.user.email||'')}</span><button id="logoutBtn" class="ghost">登出</button>` : `<button id="loginBtn" class="primary">Google 登入</button>`}
+      <div class="topbar-inner">
+        <button class="app-brand" data-nav="/" aria-label="回到 Polik Vote 投票首頁">
+          <img src="./polik-vote-mark.svg" alt="" width="44" height="44">
+          <span><strong>Polik Vote</strong><small>共識投票平台</small></span>
+        </button>
+        <nav class="nav" aria-label="投票平台導覽">
+          <a class="portfolio-link" href="https://polik18.github.io/">← Polik 專案總覽</a>
+          <button data-nav="/">投票首頁</button>
+          ${state.user ? `<button data-nav="/polls">參與投票</button>` : ''}
+          ${role==='admin'||role==='super_admin' ? `<button data-nav="/admin">管理</button>` : ''}
+          ${role==='super_admin' ? `<button data-nav="/admins">管理員</button>` : ''}
+          ${state.user ? `<span class="account-chip" title="${esc(state.user.email||'')}">${esc(state.user.email||'')}</span><button id="logoutBtn" class="ghost">登出</button>` : `<button id="loginBtn" class="primary">Google 登入</button>`}
+        </nav>
       </div>
     </header>
-    <main class="container">${content}<div class="footer-note">GitHub Pages + Firebase Authentication + Cloudflare Workers + D1</div></main>
+    <main class="container" id="main">${content}</main>
+    <footer class="app-footer">
+      <div><strong>Polik Vote</strong><span>讓表決有清楚的規則、資格與結果。</span></div>
+      <div><a href="https://polik18.github.io/">Polik Projects</a><span>GitHub Pages · Firebase · Cloudflare</span></div>
+    </footer>
   </div>`;
 }
 
@@ -76,22 +87,31 @@ async function render() {
 function renderHome() {
   app.innerHTML = shell(`
     <section class="hero">
-      <div>
-        <span class="badge">免費・300+ 人・Google 登入</span>
-        <h1>一個可重複使用的線上投票平台。</h1>
-        <p>支援記名／不記名、單選、多選、配票、Email 白名單、指定網域、法定人數與通過門檻。前端可放 GitHub Pages。</p>
-        <div class="row">
+      <div class="hero-copy">
+        <p class="eyebrow">Polik Projects · Voting & Decisions</p>
+        <div class="badge-row"><span class="badge">Google 帳號驗證</span><span class="badge warm">支援 300+ 人</span></div>
+        <h1>讓每一次投票，<em>都有清楚的規則與結果。</em></h1>
+        <p>從班級票選、校務意見到組織決策，支援記名／不記名、白名單、指定網域與多種票制，讓發起、參與和結果管理集中在同一個流程。</p>
+        <div class="row hero-actions">
           ${state.user ? `<button class="primary" data-nav="/polls">查看可參與投票</button>` : `<button id="heroLogin" class="primary">使用 Google 帳號登入</button>`}
           ${state.me?.role==='admin'||state.me?.role==='super_admin' ? `<button class="secondary" data-nav="/admin">進入管理後台</button>` : ''}
         </div>
+        <p class="service-note">本服務需要 Google 帳號與網路連線；是否可參與由各投票的資格規則決定。</p>
       </div>
       <div class="hero-card">
-        <h3>本系統支援</h3>
-        <p>✓ 公開 / Email 白名單 / 指定 Google Workspace 網域</p>
-        <p>✓ 一人一票 / 最多 N 個 / N 票自由分配</p>
-        <p>✓ 記名與不記名參與模式</p>
-        <p>✓ CSV 名單匯入與結果匯出</p>
+        <div class="hero-card-label">A clear voting flow</div>
+        <h2>從資格設定到結果匯出，<br>每一步都看得懂。</h2>
+        <ol class="flow-list">
+          <li><span>01</span><div><strong>設定參與資格</strong><small>公開、Email 白名單或指定網域</small></div></li>
+          <li><span>02</span><div><strong>選擇票制與規則</strong><small>單選、多選、配票及是否允許改票</small></div></li>
+          <li><span>03</span><div><strong>掌握結果與門檻</strong><small>法定人數、通過條件與 CSV 匯出</small></div></li>
+        </ol>
       </div>
+    </section>
+    <section class="feature-grid" aria-label="平台特色">
+      <article><span>IDENTITY</span><h2>資格有依據</h2><p>透過 Google 帳號辨識參與者，並依公開、白名單或 Workspace 網域控制資格。</p></article>
+      <article><span>BALLOT</span><h2>票制有彈性</h2><p>支援一人一票、多選與自由配票，也能設定記名、不記名、截止與改票規則。</p></article>
+      <article><span>RESULTS</span><h2>結果可管理</h2><p>依需求控制公布時機，搭配排名、百分比、法定人數、通過門檻與 CSV 匯出。</p></article>
     </section>
   `); bindShell();
   if (qs('#heroLogin')) qs('#heroLogin').onclick=()=>signInWithPopup(auth,provider).catch(showError);
