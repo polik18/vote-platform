@@ -10,5 +10,5 @@ export const CONFIG = {
     appId: '1:119726493010:web:bc999679de1596776efe8b',
     measurementId: 'G-KY3GY3P33D'
   },
-  apiBase: 'https://REPLACE_ME.workers.dev/api'
+  apiBase: 'https://vote-platform-api.vote-platform-api.workers.dev/api'
 };
