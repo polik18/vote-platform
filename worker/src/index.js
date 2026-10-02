@@ -69,7 +69,6 @@ async function authenticate(request, env) {
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token || !env.FIREBASE_PROJECT_ID) return null;
   try {
-    const jwks = createRemoteJWKSet(new URL('https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com'));
     const { payload } = await jwtVerify(token, jwksResolver, {
       issuer: `https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`,
       audience: env.FIREBASE_PROJECT_ID
@@ -318,6 +317,7 @@ async function castVote(user, env, request, poll) {
   const ballotId = existing?.ballot_id || crypto.randomUUID();
   const now = new Date().toISOString();
   const named = poll.anonymity === 'named';
+  const anon = !named;
   const voteCount = choices.reduce((s,c)=>s+c.votes,0);
   const ballotJson = JSON.stringify(choices);
 
@@ -326,14 +326,14 @@ async function castVote(user, env, request, poll) {
     stmts.push(env.DB.prepare('UPDATE participation SET email=?,display_name=?,vote_count=?,updated_at=? WHERE poll_id=? AND uid=?').bind(user.email,user.name,voteCount,now,poll.id,user.uid));
     stmts.push(env.DB.prepare('UPDATE ballots SET voter_uid=?,voter_email=?,voter_name=?,is_named=?,choice_json=?,updated_at=? WHERE id=? AND poll_id=?').bind(named?user.uid:null,named?user.email:null,named?user.name:null,b(named),ballotJson,now,ballotId,poll.id));
   } else {
-    stmts.push(env.DB.prepare('INSERT INTO participation(poll_id,uid,email,display_name,vote_count,ballot_id,submitted_at,updated_at) VALUES(?,?,?,?,?,?,?,?)').bind(poll.id,user.uid,user.email,user.name,voteCount,ballotId,now,now));
+    stmts.push(env.DB.prepare('INSERT INTO participation(poll_id,uid,email,display_name,vote_count,ballot_id,submitted_at,updated_at) VALUES(?,?,?,?,?,?,?,?)').bind(poll.id,user.uid,user.email,user.name,voteCount,anon?null:ballotId,now,now));
     stmts.push(env.DB.prepare('INSERT INTO ballots(id,poll_id,voter_uid,voter_email,voter_name,is_named,choice_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)').bind(ballotId,poll.id,named?user.uid:null,named?user.email:null,named?user.name:null,b(named),ballotJson,now,now));
     stmts.push(env.DB.prepare('UPDATE polls SET has_votes=1,first_vote_at=COALESCE(first_vote_at,?),status=?,updated_at=? WHERE id=?').bind(now, effectiveStatus(poll) === 'open' ? 'open' : poll.status, now, poll.id));
     // M1: freeze rules + options on first vote.
     try { await freezePollRules(env, poll); } catch (e) { await audit(env, poll.id, user, 'freeze_failed', { error: String(e) }); }
   }
   await env.DB.batch(stmts);
-  await audit(env,poll.id,user,existing?'vote_changed':'vote_submitted',{anonymous:!named,voteCount});
+  await audit(env,poll.id,user,existing?'vote_changed':'vote_submitted',{anonymous:anon,voteCount});
   return response({ok:true,changed:!!existing,voteCount},200,request,env);
 }
 
@@ -548,7 +548,14 @@ function calculateApproval(poll,votes,participants,totalVotes){
 }
 
 async function audit(env,pollId,user,action,detail){
-  await env.DB.prepare('INSERT INTO audit_logs(poll_id,actor_uid,actor_email,action,detail_json) VALUES(?,?,?,?,?)').bind(pollId,user.uid,user.email,action,JSON.stringify(detail||{})).run();
+  let actorUid = user?.uid ?? null;
+  let actorEmail = user?.email ?? null;
+  // M3-06: for anonymous polls, don't record actor identity in the audit log.
+  try {
+    const poll = await env.DB.prepare('SELECT anonymity FROM polls WHERE id=?').bind(pollId).first();
+    if (poll && poll.anonymity === 'anonymous') { actorUid = null; actorEmail = null; }
+  } catch (e) {}
+  await env.DB.prepare('INSERT INTO audit_logs(poll_id,actor_uid,actor_email,action,detail_json) VALUES(?,?,?,?,?)').bind(pollId,actorUid,actorEmail,action,JSON.stringify(detail||{})).run();
 }
 function normalizeEmail(v){const e=String(v||'').trim().toLowerCase();return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)?e:null;}
 function safeJson(v,fallback){try{return JSON.parse(v)}catch{return fallback}}

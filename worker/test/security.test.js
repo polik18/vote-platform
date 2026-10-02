@@ -134,3 +134,74 @@ test('M3-C-06: 500 responses include a request id and no SQL/stack leak', async 
   const raw = JSON.stringify(body);
   assert.ok(!/SQLITE_|near "|syntax error|at Object\.|at async/i.test(raw), 'must not leak SQL/stack');
 });
+
+// ---- M3-06: anonymous polls minimize stored identity ----
+
+async function getBallots(env, pollId) {
+  return await env.DB.prepare('SELECT voter_uid, voter_email, voter_name, is_named FROM ballots WHERE poll_id=?').bind(pollId).all();
+}
+
+async function getParticipation(env, pollId) {
+  return await env.DB.prepare('SELECT ballot_id FROM participation WHERE poll_id=?').bind(pollId).all();
+}
+
+test('M3-C-07: anonymous poll stores no uid->ballot link (participation.ballot_id null, ballots uid/email/name null)', async () => {
+  const env = freshEnv();
+  const adminToken = await makeJwt('super', 'jamespolik@gmail.com', 'admin');
+  const r = await postPoll(env, adminToken, {
+    ...BASE,
+    anonymity: 'anonymous',
+    status: 'open'
+  });
+  assert.equal(r.status, 201);
+  const pollId = r.body.id;
+
+  // Cast a vote as a regular user.
+  const voterToken = await makeJwt('alice', 'alice@example.com', 'user');
+  const voteRes = await worker.fetch(req(`/api/polls/${pollId}/vote`, {
+    method: 'POST', token: voterToken,
+    body: { choices: [{ optionId: 'a', votes: 1 }, { optionId: 'b', votes: 1 }] }
+  }), env, {});
+  assert.equal(voteRes.status, 200);
+
+  const ballots = await getBallots(env, pollId);
+  assert.ok(ballots.results.length >= 1);
+  const b = ballots.results[0];
+  assert.equal(b.voter_uid, null, 'anonymous ballots must not store voter_uid');
+  assert.equal(b.voter_email, null, 'anonymous ballots must not store voter_email');
+  assert.equal(b.voter_name, null, 'anonymous ballots must not store voter_name');
+  assert.equal(b.is_named, 0, 'anonymous ballots marked is_named=false');
+
+  const parts = await getParticipation(env, pollId);
+  assert.ok(parts.results.length >= 1);
+  assert.equal(parts.results[0].ballot_id, null, 'anonymous participation must not expose ballot_id (no uid->ballot link)');
+});
+
+test('M3-C-08: named poll still stores uid->ballot link', async () => {
+  const env = freshEnv();
+  const adminToken = await makeJwt('super', 'jamespolik@gmail.com', 'admin');
+  const r = await postPoll(env, adminToken, {
+    ...BASE,
+    anonymity: 'named',
+    status: 'open'
+  });
+  assert.equal(r.status, 201);
+  const pollId = r.body.id;
+
+  const voterToken = await makeJwt('bob', 'bob@example.com', 'user', 'bob');
+  const voteRes = await worker.fetch(req(`/api/polls/${pollId}/vote`, {
+    method: 'POST', token: voterToken,
+    body: { choices: [{ optionId: 'a', votes: 1 }] }
+  }), env, {});
+  assert.equal(voteRes.status, 200);
+
+  const ballots = await getBallots(env, pollId);
+  const b = ballots.results[0];
+  assert.equal(b.voter_uid, 'bob', 'named ballots must store voter_uid');
+  assert.equal(b.voter_email, 'bob@example.com', 'named ballots must store voter_email');
+  assert.equal(b.voter_name, 'bob', 'named ballots must store voter_name');
+  assert.equal(b.is_named, 1, 'named ballots marked is_named=true');
+
+  const parts = await getParticipation(env, pollId);
+  assert.notEqual(parts.results[0].ballot_id, null, 'named participation must expose ballot_id');
+});
