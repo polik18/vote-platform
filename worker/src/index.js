@@ -2,13 +2,15 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const jsonHeaders = { 'content-type': 'application/json; charset=utf-8' };
 
+const jwksResolver = createRemoteJWKSet(new URL('https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com'));
+
 export default {
   async fetch(request, env) {
     try {
       return await handle(request, env);
     } catch (error) {
       console.error(error);
-      return response({ error: 'internal_error', message: error?.message || 'Unexpected error' }, 500, request, env);
+      return response({ error: 'internal_error', requestId: crypto.randomUUID() }, 500, request, env);
     }
   }
 };
@@ -55,9 +57,10 @@ function corsPreflight(request, env) {
 }
 
 function response(data, status, request, env, extra = {}) {
-  return new Response(JSON.stringify(data), {
+  const data2 = { requestId: crypto.randomUUID(), ...data };
+  return new Response(JSON.stringify(data2), {
     status,
-    headers: { ...jsonHeaders, ...corsHeaders(request, env), ...extra }
+    headers: { ...jsonHeaders, ...corsHeaders(request, env), 'x-content-type-options': 'nosniff', 'x-request-id': data2.requestId, ...extra }
   });
 }
 
@@ -67,7 +70,7 @@ async function authenticate(request, env) {
   if (!token || !env.FIREBASE_PROJECT_ID) return null;
   try {
     const jwks = createRemoteJWKSet(new URL('https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com'));
-    const { payload } = await jwtVerify(token, jwks, {
+    const { payload } = await jwtVerify(token, jwksResolver, {
       issuer: `https://securetoken.google.com/${env.FIREBASE_PROJECT_ID}`,
       audience: env.FIREBASE_PROJECT_ID
     });
@@ -411,22 +414,39 @@ function pollToInput(p){ return {...publicPoll(p),voteMode:p.vote_mode,eligibili
 
 function validatePollInput(body){
   const title=String(body.title||'').trim(); if(!title) return {error:'title_required'};
+  if (title.length > 200) return {error:'title_too_long'};
   const anonymity=['named','anonymous'].includes(body.anonymity)?body.anonymity:null; if(!anonymity)return{error:'invalid_anonymity'};
   const voteMode=['single','multiple','allocate'].includes(body.voteMode)?body.voteMode:null; if(!voteMode)return{error:'invalid_vote_mode'};
-  const maxVotes=voteMode==='single'?1:Number(body.maxVotes||1); if(!Number.isInteger(maxVotes)||maxVotes<1||maxVotes>100)return{error:'invalid_max_votes'};
+  const maxVotes=voteMode==='single'?1:Number(body.maxVotes==null?1:body.maxVotes); if(!Number.isInteger(maxVotes)||maxVotes<1||maxVotes>100)return{error:'invalid_max_votes'};
   const eligibilityMode=['public','whitelist','domain'].includes(body.eligibilityMode)?body.eligibilityMode:null; if(!eligibilityMode)return{error:'invalid_eligibility_mode'};
-  const allowedDomain=eligibilityMode==='domain'?String(body.allowedDomain||'').trim().replace(/^@/,'').toLowerCase():null; if(eligibilityMode==='domain'&&!allowedDomain)return{error:'domain_required'};
+  let allowedDomain=null;
+  if (eligibilityMode==='domain'){
+    const raw=String(body.allowedDomain||'').trim().toLowerCase();
+    if(!raw)return{error:'domain_required'};
+    if (raw.includes('@')||raw.includes('/')||raw.includes(':'))return{error:'invalid_domain'};
+    if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(raw))return{error:'invalid_domain'};
+    allowedDomain=raw;
+  }
   const resultsVisibility=['public','after_vote','after_close','admin_only'].includes(body.resultsVisibility)?body.resultsVisibility:'after_close';
   const quorumType=['none','count','percent'].includes(body.quorumType)?body.quorumType:'none';
   if (quorumType === 'percent' && eligibilityMode !== 'whitelist') return {error:'percent_quorum_requires_whitelist'};
   const approvalType=['none','gt50','gte50','two_thirds','percent','count'].includes(body.approvalType)?body.approvalType:'none';
-  const options=(body.options||[]).map((o,i)=>({id:o.id,code:String(o.code||String(i+1)).trim(),label:String(o.label||'').trim(),description:String(o.description||'').trim()})).filter(o=>o.label);
+  const description=String(body.description||'').trim(); if (description.length > 5000) return {error:'description_too_long'};
+  const options=(body.options||[]).map((o,i)=>({id:o.id,code:String(o.code||'').trim(),label:String(o.label||'').trim(),description:String(o.description||'').trim()}));
   if(options.length<2)return{error:'at_least_two_options'};
+  if(options.length>100)return{error:'too_many_options'};
+  for (const o of options){
+    if(!o.code)return{error:'option_code_required'};
+    if (o.code.length>30)return{error:'option_code_too_long'};
+    if(!o.label)return{error:'option_label_required'};
+    if (o.label.length>300)return{error:'option_label_too_long'};
+    if (o.description.length>2000)return{error:'option_description_too_long'};
+  }
   const codes=new Set(options.map(o=>o.code.toLowerCase())); if(codes.size!==options.length)return{error:'duplicate_option_code'};
   const status=['draft','scheduled','open','paused','closed','archived'].includes(body.status)?body.status:'draft';
   const startAt=body.startAt?new Date(body.startAt).toISOString():null; const endAt=body.endAt?new Date(body.endAt).toISOString():null;
   if(startAt&&endAt&&startAt>=endAt)return{error:'invalid_date_range'};
-  return {value:{title,description:String(body.description||'').trim(),anonymity,voteMode,maxVotes,requireAllVotes:!!body.requireAllVotes,allowChange:!!body.allowChange,eligibilityMode,allowedDomain,resultsVisibility,showPercentages:body.showPercentages!==false,showRanking:body.showRanking!==false,quorumType,quorumValue:body.quorumValue==null?null:Number(body.quorumValue),approvalType,approvalValue:body.approvalValue==null?null:Number(body.approvalValue),startAt,endAt,status,options}};
+  return {value:{title,description,anonymity,voteMode,maxVotes,requireAllVotes:!!body.requireAllVotes,allowChange:!!body.allowChange,eligibilityMode,allowedDomain,resultsVisibility,showPercentages:body.showPercentages!==false,showRanking:body.showRanking!==false,quorumType,quorumValue:body.quorumValue==null?null:Number(body.quorumValue),approvalType,approvalValue:body.approvalValue==null?null:Number(body.approvalValue),startAt,endAt,status,options}};
 }
 
 async function checkEligibility(env,poll,user){
@@ -534,4 +554,4 @@ function normalizeEmail(v){const e=String(v||'').trim().toLowerCase();return /^[
 function safeJson(v,fallback){try{return JSON.parse(v)}catch{return fallback}}
 function b(v){return v?1:0;}
 function toCsv(headers,rows){return [headers,...rows].map(row=>row.map(csvCell).join(',')).join('\r\n');}
-function csvCell(v){const s=String(v??''); return /[",\r\n]/.test(s)?`"${s.replace(/"/g,'""')}"`:s;}
+function csvCell(v){const s=String(v??''); if(/^[\+@=\-]/.test(s)) return "'"+s; return /[",\r\n]/.test(s)?`"${s.replace(/"/g,'""')}"`:s;}
