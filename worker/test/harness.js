@@ -19,7 +19,8 @@ import { jwtVerify } from 'jose';
 const WORKER_PATH = resolve(process.cwd(), 'src/index.js');
 const MIGRATIONS = [
   readFileSync(resolve(process.cwd(), 'migrations/0001_init.sql'), 'utf8'),
-  readFileSync(resolve(process.cwd(), 'migrations/0002_poll_integrity.sql'), 'utf8')
+  readFileSync(resolve(process.cwd(), 'migrations/0002_poll_integrity.sql'), 'utf8'),
+  readFileSync(resolve(process.cwd(), 'migrations/0003_rate_limits.sql'), 'utf8')
 ];
 
 // --- D1-compatible shim over node:sqlite. ------------------------------------
@@ -162,7 +163,11 @@ function createEnv(db) {
     DB: db,
     FIREBASE_PROJECT_ID: 'vote-28c57',
     SUPER_ADMIN_EMAIL: 'jamespolik@gmail.com',
-    ALLOWED_ORIGINS: 'http://localhost:5173,https://polik18.github.io'
+    ALLOWED_ORIGINS: 'http://localhost:5173,https://polik18.github.io',
+    RATE_LIMIT_RPM: undefined,
+    RATE_LIMIT_VOTE_RPM: undefined,
+    RATE_LIMIT_WHITELIST_RPM: undefined,
+    RATE_LIMIT_AUTH_RPM: undefined
   };
 }
 

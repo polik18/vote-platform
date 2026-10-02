@@ -20,8 +20,20 @@ async function handle(request, env) {
   if (request.method === 'OPTIONS') return corsPreflight(request, env);
   if (!url.pathname.startsWith('/api/')) return response({ ok: true, service: 'vote-platform-api' }, 200, request, env);
 
+  // M3-04: throttle abnormal 401 / invalid-token volume per client IP so a
+  // single source cannot brute-force tokens. Applied before auth.
+  const authLimits = rateLimitLimits(env);
+  const ip = (request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown').split(',')[0].trim();
+  const authBudget = await checkRateLimit(env, `auth:${ip}`, authLimits.authFail);
+  if (!authBudget.allowed) return rateLimitedResponse(authBudget.retryAfter, request, env);
+
   const user = await authenticate(request, env);
   if (!user) return response({ error: 'unauthorized' }, 401, request, env);
+
+  // M3-04: general per-UID request budget.
+  const limits = rateLimitLimits(env);
+  const general = await checkRateLimit(env, `user:${user.uid}`, limits.general);
+  if (!general.allowed) return rateLimitedResponse(general.retryAfter, request, env);
 
   const path = url.pathname.replace(/^\/api\/?/, '');
   const parts = path.split('/').filter(Boolean);
@@ -60,8 +72,47 @@ function response(data, status, request, env, extra = {}) {
   const data2 = { requestId: crypto.randomUUID(), ...data };
   return new Response(JSON.stringify(data2), {
     status,
-    headers: { ...jsonHeaders, ...corsHeaders(request, env), 'x-content-type-options': 'nosniff', 'x-request-id': data2.requestId, ...extra }
+    headers: {
+      ...jsonHeaders,
+      ...corsHeaders(request, env),
+      'x-content-type-options': 'nosniff',
+      'x-frame-options': 'DENY',
+      'x-xss-protection': '1; mode=block',
+      'referrer-policy': 'no-referrer',
+      'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
+      'x-request-id': data2.requestId,
+      ...extra
+    }
   });
+}
+
+// --- M3-04: fixed-window rate limiting ----------------------------------------
+// Stored in `rate_limits`; does NOT replace the participation unique constraint.
+const RATE_WINDOW_MS = 60000;
+function rateLimitLimits(env) {
+  return {
+    general: Number(env.RATE_LIMIT_RPM ?? 120),
+    vote: Number(env.RATE_LIMIT_VOTE_RPM ?? 60),
+    whitelist: Number(env.RATE_LIMIT_WHITELIST_RPM ?? 10),
+    authFail: Number(env.RATE_LIMIT_AUTH_RPM ?? 60)
+  };
+}
+async function checkRateLimit(env, key, limit) {
+  const now = Date.now();
+  const row = await env.DB.prepare('SELECT count, window_start_ms FROM rate_limits WHERE key = ?').bind(key).first();
+  if (!row || now - row.window_start_ms >= RATE_WINDOW_MS) {
+    await env.DB.prepare('INSERT INTO rate_limits(key, count, window_start_ms) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET count=1, window_start_ms=?').bind(key, 1, now, now).run();
+    return { allowed: true, remaining: Math.max(limit - 1, 0), retryAfter: 0 };
+  }
+  const next = row.count + 1;
+  if (next > limit) {
+    return { allowed: false, remaining: 0, retryAfter: Math.ceil((row.window_start_ms + RATE_WINDOW_MS - now) / 1000) };
+  }
+  await env.DB.prepare('UPDATE rate_limits SET count = ? WHERE key = ?').bind(next, key).run();
+  return { allowed: true, remaining: Math.max(limit - next, 0), retryAfter: 0 };
+}
+function rateLimitedResponse(retryAfter, request, env) {
+  return response({ error: 'rate_limited', requestId: crypto.randomUUID() }, 429, request, env, { 'retry-after': String(retryAfter) });
 }
 
 async function authenticate(request, env) {
@@ -159,11 +210,23 @@ async function handlePolls(parts, request, env, user, url) {
   }
 
   const action = parts[2];
-  if (action === 'vote' && request.method === 'POST') return castVote(user, env, request, poll);
+  if (action === 'vote' && request.method === 'POST') {
+    // M3-04: vote frequency budget (does NOT replace participation unique constraint).
+    const limits = rateLimitLimits(env);
+    const vote = await checkRateLimit(env, `vote:${poll.id}:${user.uid}`, limits.vote);
+    if (!vote.allowed) return rateLimitedResponse(vote.retryAfter, request, env);
+    return castVote(user, env, request, poll);
+  }
   if (action === 'results' && request.method === 'GET') return getResults(user, env, request, poll);
   if (action === 'participants' && request.method === 'GET') return getParticipants(user, env, request, poll);
   if (action === 'whitelist') {
-    if (request.method === 'POST') return importWhitelist(user, env, request, poll);
+    if (request.method === 'POST') {
+      // M3-04: whitelist import frequency budget.
+      const limits = rateLimitLimits(env);
+      const wl = await checkRateLimit(env, `whitelist:${poll.id}:${user.uid}`, limits.whitelist);
+      if (!wl.allowed) return rateLimitedResponse(wl.retryAfter, request, env);
+      return importWhitelist(user, env, request, poll);
+    }
     if (request.method === 'GET') return getWhitelist(user, env, request, poll);
   }
   if (action === 'audit' && request.method === 'GET') return getAudit(user, env, request, poll);
