@@ -244,9 +244,13 @@ async function updatePoll(user, env, request, poll) {
   if (poll.status === 'archived' && p.status !== 'archived') return response({ error: 'archived_poll_is_final' }, 409, request, env);
   if (poll.has_votes && ['draft','scheduled'].includes(p.status)) return response({ error: 'cannot_revert_poll_with_votes' }, 409, request, env);
   if (poll.status === 'closed' && !['closed','archived'].includes(p.status)) return response({ error: 'closed_poll_cannot_reopen' }, 409, request, env);
+  try { await assertTransition(env, poll, poll.status, p.status, user); } catch (e) { return response({ error: e.code, detail: e.detail }, e.status, request, env); }
+  if (p.status === 'closed' && poll.status !== 'closed') {
+    try { await snapshotCloseResults(env, poll); } catch (e) {}
+  }
   const now = new Date().toISOString();
-  const statements = [env.DB.prepare(`UPDATE polls SET title=?,description=?,anonymity=?,vote_mode=?,max_votes=?,require_all_votes=?,allow_change=?,eligibility_mode=?,allowed_domain=?,results_visibility=?,show_percentages=?,show_ranking=?,quorum_type=?,quorum_value=?,approval_type=?,approval_value=?,start_at=?,end_at=?,status=?,updated_at=? WHERE id=?`).bind(
-    p.title,p.description,p.anonymity,p.voteMode,p.maxVotes,b(p.requireAllVotes),b(p.allowChange),p.eligibilityMode,p.allowedDomain,p.resultsVisibility,b(p.showPercentages),b(p.showRanking),p.quorumType,p.quorumValue,p.approvalType,p.approvalValue,p.startAt,p.endAt,p.status,now,poll.id
+  const statements = [env.DB.prepare(`UPDATE polls SET title=?,description=?,anonymity=?,vote_mode=?,max_votes=?,require_all_votes=?,allow_change=?,eligibility_mode=?,allowed_domain=?,results_visibility=?,show_percentages=?,show_ranking=?,quorum_type=?,quorum_value=?,approval_type=?,approval_value=?,start_at=?,end_at=?,status=?,version=version+1,closed_at=COALESCE(closed_at,?),archived_at=COALESCE(archived_at,?),updated_at=? WHERE id=?`).bind(
+    p.title,p.description,p.anonymity,p.voteMode,p.maxVotes,b(p.requireAllVotes),b(p.allowChange),p.eligibilityMode,p.allowedDomain,p.resultsVisibility,b(p.showPercentages),b(p.showRanking),p.quorumType,p.quorumValue,p.approvalType,p.approvalValue,p.startAt,p.endAt,p.status, p.status==='closed' ? now : null, p.status==='archived' ? now : null, now, poll.id
   )];
   if (body.options && !poll.has_votes) {
     statements.push(env.DB.prepare('DELETE FROM options WHERE poll_id=?').bind(poll.id));
@@ -321,7 +325,9 @@ async function castVote(user, env, request, poll) {
   } else {
     stmts.push(env.DB.prepare('INSERT INTO participation(poll_id,uid,email,display_name,vote_count,ballot_id,submitted_at,updated_at) VALUES(?,?,?,?,?,?,?,?)').bind(poll.id,user.uid,user.email,user.name,voteCount,ballotId,now,now));
     stmts.push(env.DB.prepare('INSERT INTO ballots(id,poll_id,voter_uid,voter_email,voter_name,is_named,choice_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)').bind(ballotId,poll.id,named?user.uid:null,named?user.email:null,named?user.name:null,b(named),ballotJson,now,now));
-    stmts.push(env.DB.prepare('UPDATE polls SET has_votes=1,updated_at=? WHERE id=?').bind(now,poll.id));
+    stmts.push(env.DB.prepare('UPDATE polls SET has_votes=1,first_vote_at=COALESCE(first_vote_at,?),status=?,updated_at=? WHERE id=?').bind(now, effectiveStatus(poll) === 'open' ? 'open' : poll.status, now, poll.id));
+    // M1: freeze rules + options on first vote.
+    try { await freezePollRules(env, poll); } catch (e) { await audit(env, poll.id, user, 'freeze_failed', { error: String(e) }); }
   }
   await env.DB.batch(stmts);
   await audit(env,poll.id,user,existing?'vote_changed':'vote_submitted',{anonymous:!named,voteCount});
@@ -430,10 +436,65 @@ async function checkEligibility(env,poll,user){
   return false;
 }
 
-function effectiveStatus(p){
+// Poll state machine (M1). status is the authoritative state machine value.
+// 0 draft, 1 scheduled, 2 open, 3 paused, 4 closed, 5 archived.
+const ALLOWED_TRANSITIONS = {
+  draft: ['draft', 'scheduled', 'open'],
+  scheduled: ['scheduled', 'open', 'closed', 'draft'],
+  open: ['open', 'paused', 'closed', 'archived'],
+  paused: ['paused', 'open', 'closed'],
+  closed: ['closed', 'archived'],
+  archived: ['archived']
+};
+function effectiveStatus(p) {
   if(['paused','closed','archived','draft'].includes(p.status)) return p.status;
   const now=Date.now(); const start=p.start_at?Date.parse(p.start_at):null; const end=p.end_at?Date.parse(p.end_at):null;
   if(end&&now>=end)return'closed'; if(start&&now<start)return'scheduled'; if(p.status==='scheduled'&&!start)return'scheduled'; return p.status==='scheduled'?'open':p.status;
+}
+
+// M1: validate a poll state transition. Throws {code,status} when forbidden.
+async function assertTransition(env, poll, fromStatus, toStatus, user) {
+  if (fromStatus === toStatus) return;
+  const allowed = ALLOWED_TRANSITIONS[fromStatus];
+  if (!allowed || !allowed.includes(toStatus)) {
+    throw { code: 'invalid_transition', status: 409,
+      detail: `cannot go from ${fromStatus} to ${toStatus}` };
+  }
+  // Record the transition immutably (store status strings for readability).
+  await env.DB.prepare('INSERT INTO poll_state_transitions(poll_id,from_state,to_state,by_uid,by_email,version) VALUES(?,?,?,?,?,?)')
+    .bind(poll.id, poll.status, p.status, user?.uid ?? null, user?.email ?? null, (poll.version || 1) + 1).run();
+}
+
+// M1: freeze poll rules + options into poll_version_locks once first vote arrives.
+async function freezePollRules(env, poll) {
+  if (poll.options_frozen_at) return;
+  const opts = await getOptions(env, poll.id);
+  const snapshot = JSON.stringify({
+    vote_mode: poll.vote_mode, max_votes: poll.max_votes,
+    require_all_votes: !!poll.require_all_votes, allow_change: !!poll.allow_change,
+    options: opts.map(o => ({ id: o.id, code: o.code, label: o.label }))
+  });
+  await env.DB.prepare('UPDATE polls SET options_frozen_at=? , version=version+1 WHERE id=?').bind(new Date().toISOString(), poll.id).run();
+  await env.DB.prepare('INSERT OR REPLACE INTO poll_version_locks(poll_id,version,rule_snapshot) VALUES(?,?,?)')
+    .bind(poll.id, (poll.version || 1) + 1, snapshot).run();
+}
+
+// M1: snapshot closed results immutably.
+async function snapshotCloseResults(env, poll) {
+  try {
+    const opts = await getOptions(env, poll.id);
+    const ballots = await env.DB.prepare('SELECT choice_json FROM ballots WHERE poll_id=?').bind(poll.id).all();
+    const counts = Object.fromEntries(opts.map(o => [o.id, 0]));
+    for (const row of ballots.results || []) {
+      for (const c of safeJson(row.choice_json, [])) {
+        if (counts[c.optionId] !== undefined) counts[c.optionId] += Number(c.votes || 0);
+      }
+    }
+    const results = opts.map(o => ({ id: o.id, code: o.code, label: o.label, votes: counts[o.id] || 0 }));
+    const snapshot = JSON.stringify({ poll_id: poll.id, status: 'closed', results, at: new Date().toISOString() });
+    await env.DB.prepare('INSERT OR REPLACE INTO poll_result_snapshots(poll_id,snapshot,created_at) VALUES(?,?,?)')
+      .bind(poll.id, snapshot, new Date().toISOString()).run();
+  } catch (e) { await audit(env, poll.id, { uid: null, email: null }, 'snapshot_close_failed', { error: String(e) }); }
 }
 
 function normalizeChoices(raw){
