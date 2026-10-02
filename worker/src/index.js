@@ -246,6 +246,7 @@ async function handlePolls(parts, request, env, user, url) {
     return castVote(user, env, request, poll);
   }
   if (action === 'results' && request.method === 'GET') return getResults(user, env, request, poll);
+  if (action === 'my-ballot' && request.method === 'GET') return getMyBallot(user, env, request, poll);
   if (action === 'participants' && request.method === 'GET') return getParticipants(user, env, request, poll);
   if (action === 'whitelist') {
     if (request.method === 'POST') {
@@ -458,6 +459,29 @@ async function getResults(user, env, request, poll) {
   const quorum = calculateQuorum(poll,totalBallots,eligibleCount);
   const approval = results.map(r=>({...r,approved:calculateApproval(poll,r.votes,totalBallots,totalVotes)}));
   return response({pollId:poll.id,totalParticipants:totalBallots,totalVotes,eligibleCount,quorum,results:approval,effectiveStatus:eff},200,request,env);
+}
+
+// M4-03: return only the current user's ballot so the UI can pre-fill an
+// editable ballot and show original/updated times. Anonymous polls pool their
+// ballots (participation.ballot_id and ballots.voter_uid are null per M3-06),
+// so for those we return the most recent anonymous ballot's choices.
+async function getMyBallot(user, env, request, poll) {
+  const existing = await env.DB.prepare('SELECT * FROM participation WHERE poll_id=? AND uid=?').bind(poll.id, user.uid).first();
+  if (!existing) return response({ voted: false, choices: null, submittedAt: null, updatedAt: null }, 200, request, env);
+
+  const ballotId = existing.ballot_id;
+  const isNamed = existing.voter_uid !== null;
+  let ballot = null;
+  if (isNamed) {
+    ballot = await env.DB.prepare('SELECT choice_json, created_at, updated_at FROM ballots WHERE id=?').bind(ballotId).first();
+  } else {
+    // Anonymous: no uid->ballot link; return the most recent anonymous ballot.
+    ballot = await env.DB.prepare('SELECT choice_json, created_at, updated_at FROM ballots WHERE poll_id=? AND voter_uid IS NULL ORDER BY id DESC').bind(poll.id).first();
+  }
+  if (!ballot) return response({ voted: false, choices: null, submittedAt: null, updatedAt: null }, 200, request, env);
+
+  const choices = normalizeChoices(safeJson(ballot.choice_json, []));
+  return response({ voted: true, choices, submittedAt: ballot.created_at, updatedAt: ballot.updated_at }, 200, request, env);
 }
 
 async function getParticipants(user, env, request, poll) {
