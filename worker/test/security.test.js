@@ -205,3 +205,18 @@ test('M3-C-08: named poll still stores uid->ballot link', async () => {
   const parts = await getParticipation(env, pollId);
   assert.notEqual(parts.results[0].ballot_id, null, 'named participation must expose ballot_id');
 });
+
+// ---- M3-07: security headers ----
+
+test('M3-07: responses set CSP and security headers', async () => {
+  const env = freshEnv();
+  const token = await makeJwt('super', 'jamespolik@gmail.com', 'admin');
+  const res = await worker.fetch(req('/api/me', { token }), env, {});
+  const h = res.headers;
+  assert.match(h.get('content-security-policy'), /default-src/, 'CSP default-src none');
+  assert.match(h.get('content-security-policy'), /frame-ancestors/, 'CSP frame-ancestors none');
+  assert.equal(h.get('x-content-type-options'), 'nosniff');
+  assert.equal(h.get('x-frame-options'), 'DENY');
+  assert.equal(h.get('x-xss-protection'), '1; mode=block');
+  assert.equal(h.get('referrer-policy'), 'no-referrer');
+});
