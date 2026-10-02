@@ -441,6 +441,19 @@ async function getResults(user, env, request, poll) {
   const visible = canManage || poll.results_visibility === 'public' || (poll.results_visibility === 'after_vote' && participation) || (poll.results_visibility === 'after_close' && ['closed','archived'].includes(eff));
   if (!visible) return response({error:'results_not_visible'},403,request,env);
 
+  // M4-02: for a closed poll, read the immutable snapshot and verify its hash
+  // before serving. A tampered snapshot is rejected so stale numbers can't
+  // be served.
+  if (eff === 'closed' || eff === 'archived') {
+    const snap = await env.DB.prepare('SELECT * FROM poll_result_snapshots WHERE poll_id=?').bind(poll.id).first();
+    if (snap && await verifySnapshotHash(snap)) {
+      const parsed = safeJson(snap.result_json, null);
+      if (parsed) return response({pollId:poll.id,totalParticipants:parsed.totalParticipants,totalVotes:parsed.totalVotes,eligibleCount:parsed.eligibleCount,quorum:parsed.quorum,results:parsed.results,effectiveStatus:eff},200,request,env);
+    } else if (snap) {
+      return response({error:'snapshot_hash_mismatch',pollId:poll.id},409,request,env);
+    }
+  }
+
   const opts = await getOptions(env,poll.id);
   // M4-01: lazily backfill ballot_choices for any pre-existing ballot, then
   // aggregate in SQL instead of shipping every ballot to the Worker.
@@ -641,6 +654,36 @@ async function freezePollRules(env, poll) {
     .bind(poll.id, (poll.version || 1) + 1, snapshot).run();
 }
 
+// M4-02: canonical content hash for tamper-evidence. Hashed fields are exactly
+// the snapshot's own stored values (the 5 the test recomputes from), so any
+// change to counts, result_json or rules_json invalidates the hash.
+async function computeSnapshotHash(snapshot) {
+  const canonical = JSON.stringify({
+    poll_id: snapshot.poll_id,
+    participant_count: snapshot.participant_count,
+    total_votes: snapshot.total_votes,
+    result_json: snapshot.result_json,
+    rules_json: snapshot.rules_json
+  });
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+async function verifySnapshotHash(snap) {
+  if (!snap.content_hash) return false;
+  return (await computeSnapshotHash(snap)) === snap.content_hash;
+}
+// M4-02: frozen poll rules stored alongside the snapshot for audit/recompute.
+function snapshotRules(poll, opts) {
+  return {
+    vote_mode: poll.vote_mode, max_votes: poll.max_votes,
+    require_all_votes: !!poll.require_all_votes, allow_change: !!poll.allow_change,
+    anonymity: poll.anonymity, eligibility_mode: poll.eligibility_mode, allowed_domain: poll.allowed_domain,
+    results_visibility: poll.results_visibility, quorum_type: poll.quorum_type, quorum_value: poll.quorum_value,
+    approval_type: poll.approval_type, approval_value: poll.approval_value,
+    options: opts.map(o => ({ id: o.id, code: o.code, label: o.label }))
+  };
+}
+
 // M1: snapshot closed results immutably.
 async function snapshotCloseResults(env, poll) {
   try {
@@ -650,16 +693,37 @@ async function snapshotCloseResults(env, poll) {
     await backfillBallotChoices(env, poll.id);
     const counts = Object.fromEntries(opts.map(o => [o.id, 0]));
     const agg = await env.DB.prepare('SELECT option_id, SUM(votes) AS votes FROM ballot_choices WHERE poll_id=? GROUP BY option_id').bind(poll.id).all();
-    let totalBallots = 0;
+    let totalBallots = 0, totalVotes = 0;
     for (const r of agg.results || []) {
-      if (counts[r.option_id] !== undefined) { counts[r.option_id] = Number(r.votes || 0); }
+      if (counts[r.option_id] !== undefined) { counts[r.option_id] = Number(r.votes || 0); totalVotes += Number(r.votes || 0); }
     }
     const totalBallotsRow = await env.DB.prepare('SELECT COUNT(*) n FROM participation WHERE poll_id=?').bind(poll.id).first();
     totalBallots = Number(totalBallotsRow?.n || 0);
+
     const results = opts.map(o => ({ id: o.id, code: o.code, label: o.label, votes: counts[o.id] || 0 }));
-    const snapshot = JSON.stringify({ poll_id: poll.id, status: 'closed', results, at: new Date().toISOString() });
-    await env.DB.prepare('INSERT OR REPLACE INTO poll_result_snapshots(poll_id,snapshot,created_at) VALUES(?,?,?)')
-      .bind(poll.id, snapshot, new Date().toISOString()).run();
+    const denom = poll.vote_mode === 'allocate' ? Math.max(totalVotes, 1) : Math.max(totalBallots, 1);
+    results.forEach(r => { r.percentage = Number(((r.votes / denom) * 100).toFixed(2)); });
+    results.sort((a, b) => b.votes - a.votes || a.code.localeCompare(b.code));
+    results.forEach((r, i) => { r.rank = i + 1; });
+    const eligibleCount = await getEligibleCount(env, poll);
+    const quorum = calculateQuorum(poll, totalBallots, eligibleCount);
+    const approval = results.map(r => ({ ...r, approved: calculateApproval(poll, r.votes, totalBallots, totalVotes) }));
+
+    // M4-02: enriched snapshot — counts, machine-readable result_json, frozen
+    // rules and a content_hash so any tamper is detectable at read time.
+    const rulesJson = JSON.stringify(snapshotRules(poll, opts));
+    const resultJson = JSON.stringify({ results: approval, totalParticipants: totalBallots, totalVotes, eligibleCount, quorum });
+    const snapshot = JSON.stringify({ poll_id: poll.id, status: 'closed', results: approval, at: new Date().toISOString() });
+    const contentHash = await computeSnapshotHash({
+      poll_id: poll.id,
+      participant_count: totalBallots,
+      total_votes: totalVotes,
+      result_json: resultJson,
+      rules_json: rulesJson
+    });
+
+    await env.DB.prepare('INSERT OR REPLACE INTO poll_result_snapshots(poll_id,snapshot,created_at,participant_count,total_votes,result_json,rules_json,content_hash) VALUES(?,?,?,?,?,?,?,?)')
+      .bind(poll.id, snapshot, new Date().toISOString(), totalBallots, totalVotes, resultJson, rulesJson, contentHash).run();
   } catch (e) { await audit(env, poll.id, { uid: null, email: null }, 'snapshot_close_failed', { error: String(e) }); }
 }
 
