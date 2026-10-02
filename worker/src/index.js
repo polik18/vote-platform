@@ -195,6 +195,13 @@ async function parseJson(request) {
   try { return await request.json(); } catch { throw httpError(400, 'invalid_json'); }
 }
 
+// M4-04: read the client-supplied idempotency key (RFC 9110 Idempotency-Key).
+// The client generates a UUID per vote attempt and sends it on every retry so a
+// lost response can be replayed instead of double-counting or erroring.
+function parseIdempotencyKey(request) {
+  try { return request.headers.get('Idempotency-Key') || null; } catch { return null; }
+}
+
 async function getMe(user, env, request) {
   const admin = await isAdmin(user, env);
   return response({ user, role: isSuper(user, env) ? 'super_admin' : admin ? 'admin' : 'voter' }, 200, request, env);
@@ -239,6 +246,14 @@ async function handlePolls(parts, request, env, user, url) {
 
   const action = parts[2];
   if (action === 'vote' && request.method === 'POST') {
+    // M4-04: idempotency replay — a retried POST carrying the same client
+    // Idempotency-Key returns the original vote result without re-running the
+    // vote, so network retries neither double-count nor 429 against the budget.
+    const idemKey = parseIdempotencyKey(request);
+    if (idemKey) {
+      const cached = await env.DB.prepare('SELECT result_json FROM idempotency_keys WHERE poll_id=? AND uid=? AND key=?').bind(poll.id, user.uid, idemKey).first();
+      if (cached) return response(safeJson(cached.result_json, { error: 'idem_cache_corrupt' }), 200, request, env);
+    }
     // M3-04: vote frequency budget (does NOT replace participation unique constraint).
     const limits = rateLimitLimits(env);
     const vote = await checkRateLimit(env, `vote:${poll.id}:${user.uid}`, limits.vote);
@@ -397,6 +412,7 @@ async function getWhitelist(user, env, request, poll) {
 }
 
 async function castVote(user, env, request, poll) {
+  const idemKey = parseIdempotencyKey(request);
   const eligible = await checkEligibility(env,poll,user);
   if (!eligible) return response({error:'not_eligible'},403,request,env);
   if (effectiveStatus(poll) !== 'open') return response({error:'poll_not_open'},409,request,env);
@@ -430,6 +446,11 @@ async function castVote(user, env, request, poll) {
   await env.DB.batch(stmts);
   await syncBallotChoices(env,poll.id,ballotId,choices);
   await audit(env,poll.id,user,existing?'vote_changed':'vote_submitted',{anonymous:anon,voteCount});
+  // M4-04: record the vote result under the idempotency key so a retried POST
+  // with the same key (caught in routing) replays this exact result.
+  if (idemKey) {
+    await env.DB.prepare('INSERT INTO idempotency_keys(poll_id,uid,key,result_json) VALUES(?,?,?,?)').bind(poll.id,user.uid,idemKey,JSON.stringify({ok:true,changed:!!existing,voteCount})).run();
+  }
   return response({ok:true,changed:!!existing,voteCount},200,request,env);
 }
 

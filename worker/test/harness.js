@@ -23,7 +23,8 @@ const MIGRATIONS = [
   readFileSync(resolve(process.cwd(), 'migrations/0003_rate_limits.sql'), 'utf8'),
   readFileSync(resolve(process.cwd(), 'migrations/0004_site_stats.sql'), 'utf8'),
   readFileSync(resolve(process.cwd(), 'migrations/0005_ballot_choices.sql'), 'utf8'),
-  readFileSync(resolve(process.cwd(), 'migrations/0006_snapshot_enrichment.sql'), 'utf8')
+  readFileSync(resolve(process.cwd(), 'migrations/0006_snapshot_enrichment.sql'), 'utf8'),
+  readFileSync(resolve(process.cwd(), 'migrations/0007_idempotency_keys.sql'), 'utf8')
 ];
 
 // --- D1-compatible shim over node:sqlite. ------------------------------------
@@ -150,12 +151,13 @@ async function makeJwt(sub, email, role = 'user', name = 'Test User', sign_in_pr
 }
 
 // --- Request builder ---------------------------------------------------------
-function req(path, { method = 'GET', body, token } = {}) {
-  const headers = new Headers({ 'content-type': 'application/json' });
-  if (token) headers.set('authorization', `Bearer ${token}`);
+function req(path, { method = 'GET', body, token, headers } = {}) {
+  const h = new Headers({ 'content-type': 'application/json' });
+  if (token) h.set('authorization', `Bearer ${token}`);
+  if (headers) for (const [k, v] of Object.entries(headers)) h.set(k, v);
   return new Request('https://api.example.com' + path, {
     method,
-    headers,
+    headers: h,
     body: body ? JSON.stringify(body) : undefined
   });
 }
