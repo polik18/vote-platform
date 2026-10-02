@@ -20,7 +20,8 @@ const WORKER_PATH = resolve(process.cwd(), 'src/index.js');
 const MIGRATIONS = [
   readFileSync(resolve(process.cwd(), 'migrations/0001_init.sql'), 'utf8'),
   readFileSync(resolve(process.cwd(), 'migrations/0002_poll_integrity.sql'), 'utf8'),
-  readFileSync(resolve(process.cwd(), 'migrations/0003_rate_limits.sql'), 'utf8')
+  readFileSync(resolve(process.cwd(), 'migrations/0003_rate_limits.sql'), 'utf8'),
+  readFileSync(resolve(process.cwd(), 'migrations/0004_site_stats.sql'), 'utf8')
 ];
 
 // --- D1-compatible shim over node:sqlite. ------------------------------------
@@ -167,7 +168,8 @@ function createEnv(db) {
     RATE_LIMIT_RPM: undefined,
     RATE_LIMIT_VOTE_RPM: undefined,
     RATE_LIMIT_WHITELIST_RPM: undefined,
-    RATE_LIMIT_AUTH_RPM: undefined
+    RATE_LIMIT_AUTH_RPM: undefined,
+    RATE_LIMIT_SITE_RPM: undefined
   };
 }
 

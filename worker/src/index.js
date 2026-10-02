@@ -27,6 +27,10 @@ async function handle(request, env) {
   const authBudget = await checkRateLimit(env, `auth:${ip}`, authLimits.authFail);
   if (!authBudget.allowed) return rateLimitedResponse(authBudget.retryAfter, request, env);
 
+  // M4-02: public heartbeat endpoint — unauthenticated, handled before auth.
+  const sitePath = url.pathname.replace(/^\/api\/?/, '');
+  if (sitePath === 'site-stats' && request.method === 'POST') return postSiteStats(env, request);
+
   const user = await authenticate(request, env);
   if (!user) return response({ error: 'unauthorized' }, 401, request, env);
 
@@ -113,6 +117,30 @@ async function checkRateLimit(env, key, limit) {
 }
 function rateLimitedResponse(retryAfter, request, env) {
   return response({ error: 'rate_limited', requestId: crypto.randomUUID() }, 429, request, env, { 'retry-after': String(retryAfter) });
+}
+
+// M4-02: public heartbeat endpoint for anonymous site traffic.
+// Records one row per heartbeat; per-IP rate limited so a single visitor
+// cannot flood the table. All fields are sanitized strings.
+async function postSiteStats(env, request) {
+  const ip = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || '';
+  const budget = await checkRateLimit(env, `site:${ip}`, Number(env.RATE_LIMIT_SITE_RPM ?? 60));
+  if (!budget.allowed) return rateLimitedResponse(budget.retryAfter, request, env);
+
+  const body = await parseJson(request);
+  const page = typeof body.page === 'string' ? String(body.page).slice(0, 2000) : '/';
+  const visitorId = typeof body.visitorId === 'string' ? String(body.visitorId).slice(0, 64) : '';
+  const duration = typeof body.duration === 'number' && body.duration >= 0 && Number.isFinite(body.duration)
+    ? Math.floor(body.duration) : null;
+  const device = typeof body.device === 'string' ? String(body.device).slice(0, 64) : '';
+  const referrer = typeof body.referrer === 'string' ? String(body.referrer).slice(0, 2048) : '';
+  if (!visitorId) return response({ error: 'visitor_id_required' }, 400, request, env);
+
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    'INSERT INTO site_stats(page, visitorId, duration, device, referrer, ip, createdAt) VALUES(?,?,?,?,?,?,?)'
+  ).bind(page, visitorId, duration, device, referrer, ip, now).run();
+  return response({ ok: true }, 201, request, env);
 }
 
 async function authenticate(request, env) {
