@@ -74,6 +74,9 @@ async function authenticate(request, env) {
       audience: env.FIREBASE_PROJECT_ID
     });
     if (!payload.sub || !payload.email || payload.email_verified === false) return null;
+    // M3-03: only Google sign-in tokens are trusted (real Firebase tokens set
+    // this; password/other providers must not be accepted here).
+    if (payload.sign_in_provider !== 'google.com') return null;
     return {
       uid: String(payload.sub),
       email: String(payload.email).toLowerCase(),

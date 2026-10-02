@@ -129,7 +129,7 @@ async function setupJwks() {
 }
 
 // --- JWT minting -------------------------------------------------------------
-async function makeJwt(sub, email, role = 'user', name = 'Test User') {
+async function makeJwt(sub, email, role = 'user', name = 'Test User', sign_in_provider = 'google.com') {
   const claims = {
     iss: 'https://securetoken.google.com/vote-28c57',
     aud: 'vote-28c57',
@@ -139,6 +139,7 @@ async function makeJwt(sub, email, role = 'user', name = 'Test User') {
     name,
     role
   };
+  if (sign_in_provider !== null) claims.sign_in_provider = sign_in_provider;
   return new jose.SignJWT(claims)
     .setProtectedHeader({ alg: 'RS256', kid: 'test-key' })
     .sign(testPrivateKey);
