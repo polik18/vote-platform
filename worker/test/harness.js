@@ -21,7 +21,8 @@ const MIGRATIONS = [
   readFileSync(resolve(process.cwd(), 'migrations/0001_init.sql'), 'utf8'),
   readFileSync(resolve(process.cwd(), 'migrations/0002_poll_integrity.sql'), 'utf8'),
   readFileSync(resolve(process.cwd(), 'migrations/0003_rate_limits.sql'), 'utf8'),
-  readFileSync(resolve(process.cwd(), 'migrations/0004_site_stats.sql'), 'utf8')
+  readFileSync(resolve(process.cwd(), 'migrations/0004_site_stats.sql'), 'utf8'),
+  readFileSync(resolve(process.cwd(), 'migrations/0005_ballot_choices.sql'), 'utf8')
 ];
 
 // --- D1-compatible shim over node:sqlite. ------------------------------------

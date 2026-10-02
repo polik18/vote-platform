@@ -428,6 +428,7 @@ async function castVote(user, env, request, poll) {
     try { await freezePollRules(env, poll); } catch (e) { await audit(env, poll.id, user, 'freeze_failed', { error: String(e) }); }
   }
   await env.DB.batch(stmts);
+  await syncBallotChoices(env,poll.id,ballotId,choices);
   await audit(env,poll.id,user,existing?'vote_changed':'vote_submitted',{anonymous:anon,voteCount});
   return response({ok:true,changed:!!existing,voteCount},200,request,env);
 }
@@ -441,15 +442,17 @@ async function getResults(user, env, request, poll) {
   if (!visible) return response({error:'results_not_visible'},403,request,env);
 
   const opts = await getOptions(env,poll.id);
-  const ballots = await env.DB.prepare('SELECT choice_json FROM ballots WHERE poll_id=?').bind(poll.id).all();
+  // M4-01: lazily backfill ballot_choices for any pre-existing ballot, then
+  // aggregate in SQL instead of shipping every ballot to the Worker.
+  await backfillBallotChoices(env,poll.id);
   const counts = Object.fromEntries(opts.map(o=>[o.id,0]));
+  const agg = await env.DB.prepare('SELECT option_id, SUM(votes) AS votes FROM ballot_choices WHERE poll_id=? GROUP BY option_id').bind(poll.id).all();
   let totalBallots=0,totalVotes=0;
-  for (const row of ballots.results||[]) {
-    totalBallots++;
-    for (const c of safeJson(row.choice_json,[])) {
-      if (counts[c.optionId] !== undefined) { counts[c.optionId]+=Number(c.votes||0); totalVotes+=Number(c.votes||0); }
-    }
+  for (const r of agg.results||[]) {
+    if (counts[r.option_id] !== undefined) { counts[r.option_id]=Number(r.votes||0); totalVotes+=Number(r.votes||0); }
   }
+  const totalBallotsRow = await env.DB.prepare('SELECT COUNT(*) n FROM participation WHERE poll_id=?').bind(poll.id).first();
+  totalBallots = Number(totalBallotsRow?.n||0);
   const results = opts.map(o=>({id:o.id,code:o.code,label:o.label,votes:counts[o.id]||0}));
   const denom = poll.vote_mode==='allocate' ? Math.max(totalVotes,1) : Math.max(totalBallots,1);
   results.forEach(r=>r.percentage=Number(((r.votes/denom)*100).toFixed(2)));
@@ -518,6 +521,27 @@ async function exportPoll(user, env, request, poll, type) {
 
 async function getPoll(env,id){ return env.DB.prepare('SELECT * FROM polls WHERE id=?').bind(id).first(); }
 async function getOptions(env,id){ const r=await env.DB.prepare('SELECT id,code,label,description,sort_order FROM options WHERE poll_id=? ORDER BY sort_order,code').bind(id).all(); return r.results||[]; }
+
+// M4-01: keep the normalized `ballot_choices` tally in lockstep with a ballot's
+// choice_json. DELETE + INSERT in one batch is atomic; the PRIMARY KEY
+// (poll_id, ballot_id, option_id) guarantees one row per option so a re-vote
+// never leaves stale tallies behind. choice_json stays the single authoritative
+// record; ballot_choices is a derived index read by SQL aggregation.
+async function syncBallotChoices(env,pollId,ballotId,choices){
+  const stmts=[env.DB.prepare('DELETE FROM ballot_choices WHERE poll_id=? AND ballot_id=?').bind(pollId,ballotId)];
+  for(const c of choices) stmts.push(env.DB.prepare('INSERT OR IGNORE INTO ballot_choices(poll_id,ballot_id,option_id,votes) VALUES(?,?,?,?)').bind(pollId,ballotId,c.optionId,c.votes));
+  if(stmts.length>1) await env.DB.batch(stmts);
+}
+
+// M4-01: lazily backfill ballot_choices from choice_json for any ballot that
+// predates this table. node:sqlite has no JSON1, so choice_json is parsed in JS.
+// Gated by a NOT IN subquery so warm polls cost one indexed scan, no writes.
+async function backfillBallotChoices(env,pollId){
+  const rows=await env.DB.prepare('SELECT id,choice_json FROM ballots WHERE poll_id=? AND id NOT IN (SELECT DISTINCT ballot_id FROM ballot_choices WHERE poll_id=?)').bind(pollId,pollId).all();
+  const stmts=[];
+  for(const row of rows.results||[]) for(const c of normalizeChoices(safeJson(row.choice_json,[]))) stmts.push(env.DB.prepare('INSERT OR IGNORE INTO ballot_choices(poll_id,ballot_id,option_id,votes) VALUES(?,?,?,?)').bind(pollId,row.id,c.optionId,c.votes));
+  if(stmts.length) await env.DB.batch(stmts);
+}
 
 function publicPoll(p){
   return {
@@ -621,13 +645,17 @@ async function freezePollRules(env, poll) {
 async function snapshotCloseResults(env, poll) {
   try {
     const opts = await getOptions(env, poll.id);
-    const ballots = await env.DB.prepare('SELECT choice_json FROM ballots WHERE poll_id=?').bind(poll.id).all();
+    // M4-01: backfill + aggregate in SQL (same path as getResults) so the
+    // closed snapshot is computed from ballot_choices, not choice_json.
+    await backfillBallotChoices(env, poll.id);
     const counts = Object.fromEntries(opts.map(o => [o.id, 0]));
-    for (const row of ballots.results || []) {
-      for (const c of safeJson(row.choice_json, [])) {
-        if (counts[c.optionId] !== undefined) counts[c.optionId] += Number(c.votes || 0);
-      }
+    const agg = await env.DB.prepare('SELECT option_id, SUM(votes) AS votes FROM ballot_choices WHERE poll_id=? GROUP BY option_id').bind(poll.id).all();
+    let totalBallots = 0;
+    for (const r of agg.results || []) {
+      if (counts[r.option_id] !== undefined) { counts[r.option_id] = Number(r.votes || 0); }
     }
+    const totalBallotsRow = await env.DB.prepare('SELECT COUNT(*) n FROM participation WHERE poll_id=?').bind(poll.id).first();
+    totalBallots = Number(totalBallotsRow?.n || 0);
     const results = opts.map(o => ({ id: o.id, code: o.code, label: o.label, votes: counts[o.id] || 0 }));
     const snapshot = JSON.stringify({ poll_id: poll.id, status: 'closed', results, at: new Date().toISOString() });
     await env.DB.prepare('INSERT OR REPLACE INTO poll_result_snapshots(poll_id,snapshot,created_at) VALUES(?,?,?)')
