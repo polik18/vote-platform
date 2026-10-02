@@ -1,0 +1,13 @@
+# 環境變數治理（M0）
+# 本地開發與 CI 用，不提交到 git（已在 .gitignore）。
+# 正式環境的這些變數由 wrangler.toml [vars] 與 Cloudflare 控制台設定。
+
+# ===== 本地開發 / staging =====
+# 複製本檔為 .dev.vars 使用：cp .dev.vars.example .dev.vars
+FIREBASE_PROJECT_ID=vote-28c57
+SUPER_ADMIN_EMAIL=jamespolik@gmail.com
+ALLOWED_ORIGINS=http://localhost:5173,https://polik18.github.io
+
+# ===== 正式環境 =====
+# 正式 SUPER_ADMIN_EMAIL 由管理員在 Cloudflare 控制台確認。
+# 部署前務必核對 [vars] 與本檔一致。
