@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "test": "wrangler test",
     "db:create": "wrangler d1 create vote-platform-db",
     "db:migrate:local": "wrangler d1 migrations apply vote-platform-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply vote-platform-db --remote"

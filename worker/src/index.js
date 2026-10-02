@@ -206,7 +206,7 @@ async function createPoll(user, env, request) {
       p.quorumType, p.quorumValue, p.approvalType, p.approvalValue, p.startAt, p.endAt, p.status, now, now
     )
   ];
-  p.options.forEach((o, i) => statements.push(env.DB.prepare('INSERT INTO options(id,poll_id,code,label,description,sort_order) VALUES(?,?,?,?,?,?)').bind(crypto.randomUUID(), id, o.code, o.label, o.description || '', i)));
+  p.options.forEach((o, i) => statements.push(env.DB.prepare('INSERT INTO options(id,poll_id,code,label,description,sort_order) VALUES(?,?,?,?,?,?)').bind(o.id || crypto.randomUUID(), id, o.code, o.label, o.description || '', i)));
   await env.DB.batch(statements);
   await audit(env, id, user, 'poll_created', { title: p.title });
   return response({ ok: true, id }, 201, request, env);
@@ -254,7 +254,7 @@ async function updatePoll(user, env, request, poll) {
   )];
   if (body.options && !poll.has_votes) {
     statements.push(env.DB.prepare('DELETE FROM options WHERE poll_id=?').bind(poll.id));
-    p.options.forEach((o,i)=> statements.push(env.DB.prepare('INSERT INTO options(id,poll_id,code,label,description,sort_order) VALUES(?,?,?,?,?,?)').bind(crypto.randomUUID(),poll.id,o.code,o.label,o.description||'',i)));
+    p.options.forEach((o,i)=> statements.push(env.DB.prepare('INSERT INTO options(id,poll_id,code,label,description,sort_order) VALUES(?,?,?,?,?,?)').bind(o.id || crypto.randomUUID(),poll.id,o.code,o.label,o.description||'',i)));
   }
   await env.DB.batch(statements);
   await audit(env, poll.id, user, 'poll_updated', { fields: Object.keys(body) });
@@ -462,7 +462,7 @@ async function assertTransition(env, poll, fromStatus, toStatus, user) {
   }
   // Record the transition immutably (store status strings for readability).
   await env.DB.prepare('INSERT INTO poll_state_transitions(poll_id,from_state,to_state,by_uid,by_email,version) VALUES(?,?,?,?,?,?)')
-    .bind(poll.id, poll.status, p.status, user?.uid ?? null, user?.email ?? null, (poll.version || 1) + 1).run();
+    .bind(poll.id, poll.status, toStatus, user?.uid ?? null, user?.email ?? null, (poll.version || 1) + 1).run();
 }
 
 // M1: freeze poll rules + options into poll_version_locks once first vote arrives.
