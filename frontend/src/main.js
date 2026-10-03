@@ -11,8 +11,11 @@ provider.setCustomParameters({ prompt: 'select_account' });
 const app = document.querySelector('#app');
 const state = { user: null, me: null, polls: [], currentPoll: null };
 
-const esc = (s='') => String(s).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const esc = (s='') => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt = v => v ? new Date(v).toLocaleString('zh-TW', { hour12:false }) : '—';
+
+async function getMyBallot(pollId){try{const d=await api(`/polls/${pollId}/my-ballot`);if(!d||!d.choice_json)return null;try{return JSON.parse(d.choice_json);}catch(e){return null;}}catch(e){return null;}}
+function renderBallotSummary(choice_json,options){if(!choice_json)return '<span class="muted">（尚未投票）</span>';let c;try{c=JSON.parse(choice_json);}catch(e){return '<span class="muted">（無法讀取）</span>';}const byId=(options||[]).find(o=>o.id===c.optionId)||{label:c.optionId,code:c.optionId};return `<strong>${esc(byId.label||byId.code)}</strong> · ${esc(String(c.votes))} 票`;}
 const route = () => location.hash.slice(1) || '/';
 const qs = sel => document.querySelector(sel);
 const qsa = sel => [...document.querySelectorAll(sel)];
@@ -68,7 +71,15 @@ function bindShell() {
 
 function showError(e) {
   console.error(e);
-  alert(`發生錯誤：${e?.data?.error || e?.message || e}`);
+  const msg=e?.data?.error||e?.message||e;
+  const status=qs('#voteStatus');
+  if(status){status.textContent='出錯：'+msg;status.className='muted small error';}
+  else alert(`發生錯誤：${msg}`);
+}
+function showSuccess(msg){
+  const status=qs('#voteStatus');
+  if(status){status.textContent=msg;status.className='muted small success';}
+  else alert(msg);
 }
 
 async function render() {
@@ -160,7 +171,7 @@ function renderVoteInputs(p,participation){
   if(p.voteMode==='single') options=p.options.map(o=>`<label class="vote-option"><span><input type="radio" name="single" value="${o.id}"> <strong>${esc(o.code)} ${esc(o.label)}</strong></span><span class="muted small">${esc(o.description||'')}</span></label>`).join('');
   if(p.voteMode==='multiple') options=p.options.map(o=>`<label class="vote-option"><span><input type="checkbox" class="multi" value="${o.id}"> <strong>${esc(o.code)} ${esc(o.label)}</strong></span><span class="muted small">${esc(o.description||'')}</span></label>`).join('');
   if(p.voteMode==='allocate') options=p.options.map(o=>`<div class="vote-option alloc"><div><strong>${esc(o.code)} ${esc(o.label)}</strong><div class="muted small">${esc(o.description||'')}</div></div><input class="allocInput" type="number" min="0" max="${p.maxVotes}" value="0" data-option="${o.id}"></div>`).join('');
-  return `<h3>請投票</h3><p class="muted">${p.requireAllVotes?'必須使用完整票數。':'可以不投滿全部票數。'} ${p.allowChange?'截止前可修改。':'送出後不可修改。'}</p><div class="grid">${options}</div><div class="row-between" style="margin-top:16px"><span id="voteCounter" class="muted small"></span><button id="submitVote" class="primary">${participation?'更新投票':'送出投票'}</button></div>`;
+  return `<h3>請投票</h3><p class="muted">${p.requireAllVotes?'必須使用完整票數。':'可以不投滿全部票數。'} ${p.allowChange?'截止前可修改。':'送出後不可修改。'}</p><div class="grid">${options}</div><div id="voteStatus" role="status" aria-live="polite" class="muted small"></div><div class="row-between" style="margin-top:16px"><span id="voteCounter" class="muted small"></span><button id="submitVote" class="primary">${participation?'更新投票':'送出投票'}</button></div>`;
 }
 
 function bindVote(p){
@@ -178,7 +189,34 @@ function bindVote(p){
     if(p.voteMode==='multiple')qsa('.multi:checked').forEach(x=>choices.push({optionId:x.value,votes:1}));
     if(p.voteMode==='allocate')qsa('.allocInput').filter(x=>Number(x.value)>0).forEach(x=>choices.push({optionId:x.dataset.option,votes:Number(x.value)}));
     if(!confirm('確定送出這次投票嗎？'))return;
-    try{await api(`/polls/${p.id}/vote`,{method:'POST',body:JSON.stringify({choices})}); alert('投票成功'); renderPoll(p.id);}catch(e){showError(e);}
+    // M4-05: 驗證錯誤顯示於欄位附近（voteStatus）。
+    if(!choices.length){const status=qs('#voteStatus');status.textContent='請至少選擇一項。';status.className='muted small error';qs('#submitVote').focus();return;}
+    // M4-04: 斷線後先查 my-ballot，不盲目重送。
+    const prior=await getMyBallot(p.id);
+    // M4-05: 改票前顯示完整選票摘要及「取代上一張選票」。
+    if(prior){const summary=renderBallotSummary(prior.choice_json,p.options);if(!confirm(`你已有一張選票：${summary}。\n確定要取代上一張選票嗎？`))return;}
+    // M4-04: 送出後立即 disable 按鈕 + 顯示處理中狀態。
+    const btn=qs('#submitVote');const status=qs('#voteStatus');
+    btn.disabled=true;status.textContent='投票處理中…';
+    // M4-04: 使用 idempotency key 處理網路重試。
+    const idemKey=crypto.randomUUID();
+    const headers={};if(idemKey)headers['Idempotency-Key']=idemKey;
+    try{
+      const res=await api(`/polls/${p.id}/vote`,{method:'POST',body:JSON.stringify({choices}),headers});
+      if(!res.ok){const err=await res.json().catch(()=>({}));showError(new Error(err.message||'投票失敗'));}
+      else{const data=await res.json();
+        if(data.changed)showSuccess('投票成功');
+        else showSuccess('已記錄你之前的投票，不重複計入');
+        // M4-05: 成功後管理焦點。
+        btn.focus();}
+    }catch(err){
+      // M4-04: 網路錯誤時先查 my-ballot，避免盲目重送。
+      const check=await getMyBallot(p.id);
+      if(check)showError(new Error('網路錯誤，但已發現你之前的選票，未重複計入。'));
+      else showError(new Error('投票失敗，請稍後重試。'));
+    }finally{
+      btn.disabled=false;
+    }
   };
 }
 
@@ -241,19 +279,19 @@ async function renderPollAdmin(id){
     const results=await api(`/polls/${id}/results`).catch(()=>null); const participants=await api(`/polls/${id}/participants`).catch(()=>({participants:[]}));
     app.innerHTML=shell(`<div class="row-between"><div><span class="badge ${p.effectiveStatus}">${statusText(p.effectiveStatus)}</span><h1 style="margin:10px 0">${esc(p.title)}</h1><div class="muted">建立者：${esc(p.ownerEmail)}</div></div><div class="row"><button class="secondary" id="duplicateBtn">複製</button><button class="danger" id="deleteBtn">刪除</button></div></div>
       <div class="grid grid-3" style="margin:18px 0"><div class="stat"><span>參與人數</span><strong>${participants.participants.length}</strong></div><div class="stat"><span>總票數</span><strong>${results?.totalVotes??'—'}</strong></div><div class="stat"><span>模式</span><strong style="font-size:18px">${p.anonymity==='anonymous'?'不記名':'記名'} / ${voteModeText(p)}</strong></div></div>
-      <div class="tabs"><button class="active" data-tab="edit">設定</button><button data-tab="participants">參與名單</button><button data-tab="results">結果</button><button data-tab="whitelist">白名單</button><button data-tab="audit">Audit Log</button></div>
-      <div id="tab-edit" class="tabPane card">${pollForm(p)}</div>
-      <div id="tab-participants" class="tabPane card" hidden>${participantsTable(participants.participants)}<div class="row"><button class="secondary exportBtn" data-type="participants">匯出參與名單 CSV</button>${p.anonymity==='named'?'<button class="secondary exportBtn" data-type="named_votes">匯出記名選票 CSV</button>':''}</div></div>
-      <div id="tab-results" class="tabPane card" hidden>${results?resultsHtml(results):'<div class="muted">目前無法查看結果。</div>'}<div class="row"><button class="secondary exportBtn" data-type="results">匯出結果 CSV</button></div></div>
-      <div id="tab-whitelist" class="tabPane card" hidden>${whitelistPanel(p)}</div>
-      <div id="tab-audit" class="tabPane card" hidden><button id="loadAudit" class="secondary">載入紀錄</button><div id="auditArea"></div></div>`); bindShell(); bindPollForm(p); bindAdminTabs();
+      <div class="tabs" role="tablist" aria-label="投票設定" style="margin:18px 0"><button class="active" role="tab" data-tab="edit" aria-selected="true" id="tab-btn-edit">設定</button><button role="tab" data-tab="participants" aria-selected="false" id="tab-btn-participants">參與名單</button><button role="tab" data-tab="results" aria-selected="false" id="tab-btn-results">結果</button><button role="tab" data-tab="whitelist" aria-selected="false" id="tab-btn-whitelist">白名單</button><button role="tab" data-tab="audit" aria-selected="false" id="tab-btn-audit">Audit Log</button></div>
+      <div id="tab-edit" class="tabPane card" role="tabpanel" aria-labelledby="tab-btn-edit">${pollForm(p)}</div>
+      <div id="tab-participants" class="tabPane card" role="tabpanel" aria-labelledby="tab-btn-participants" hidden>${participantsTable(participants.participants)}<div class="row"><button class="secondary exportBtn" data-type="participants">匯出參與名單 CSV</button>${p.anonymity==='named'?'<button class="secondary exportBtn" data-type="named_votes">匯出記名選票 CSV</button>':''}</div></div>
+      <div id="tab-results" class="tabPane card" role="tabpanel" aria-labelledby="tab-btn-results" hidden>${results?resultsHtml(results):'<div class="muted">目前無法查看結果。</div>'}<div class="row"><button class="secondary exportBtn" data-type="results">匯出結果 CSV</button></div></div>
+      <div id="tab-whitelist" class="tabPane card" role="tabpanel" aria-labelledby="tab-btn-whitelist" hidden>${whitelistPanel(p)}</div>
+      <div id="tab-audit" class="tabPane card" role="tabpanel" aria-labelledby="tab-btn-audit" hidden><button id="loadAudit" class="secondary">載入紀錄</button><div id="auditArea"></div></div>`); bindShell(); bindPollForm(p); bindAdminTabs();
     qs('#duplicateBtn').onclick=async()=>{try{const r=await api(`/polls/${id}/duplicate`,{method:'POST',body:'{}'}); location.hash=`/admin/poll/${r.id}`;}catch(e){showError(e);}};
     qs('#deleteBtn').onclick=async()=>{if(!confirm('確定刪除？已有投票紀錄時系統會拒絕，請改用封存。'))return;try{await api(`/polls/${id}`,{method:'DELETE'});location.hash='/admin';}catch(e){showError(e);}};
     qsa('.exportBtn').forEach(b=>b.onclick=()=>downloadCsv(id,b.dataset.type));
     bindWhitelist(id,p); qs('#loadAudit').onclick=()=>loadAudit(id);
   }catch(e){showError(e);}
 }
-function bindAdminTabs(){qsa('[data-tab]').forEach(b=>b.onclick=()=>{qsa('[data-tab]').forEach(x=>x.classList.remove('active'));b.classList.add('active');qsa('.tabPane').forEach(p=>p.hidden=true);qs(`#tab-${b.dataset.tab}`).hidden=false;});}
+function bindAdminTabs(){const tabs=qsa('[role="tab"]');const setTab=(tab)=>{tabs.forEach(t=>{const active=t===tab;t.classList.toggle('active',active);t.setAttribute('aria-selected',active?'true':'false');});tabs.forEach(t=>{const pane=qs(`[aria-labelledby="${t.id}"]`);if(pane)pane.hidden=!active;});};tabs.forEach((tab,i)=>{tab.setAttribute('tabindex',tab.getAttribute('aria-selected')==='true'?'0':'-1');tab.onclick=()=>setTab(tab);tab.addEventListener('keydown',e=>{let target=null;if(e.key==='ArrowRight'||e.key==='ArrowLeft'){const dir=e.key==='ArrowRight'?1:-1;let j=i;do{j=(j+dir+tabs.length)%tabs.length;target=tabs[j];}while(target===tab);}else if(e.key==='Home'){target=tabs[0];}else if(e.key==='End'){target=tabs[tabs.length-1];}else return;e.preventDefault();target.focus();setTab(target);});})}
 function participantsTable(rows){return `<div class="table-wrap"><table><thead><tr><th>姓名</th><th>Email</th><th>票數</th><th>首次送出</th><th>更新</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r.display_name||'')}</td><td>${esc(r.email)}</td><td>${r.vote_count}</td><td>${fmt(r.submitted_at)}</td><td>${fmt(r.updated_at)}</td></tr>`).join('')}</tbody></table></div>`;}
 function resultsHtml(d){return `<div class="grid">${d.results.map(r=>`<div><div class="row-between"><strong>#${r.rank} ${esc(r.code)} ${esc(r.label)}</strong><span>${r.votes} 票 · ${r.percentage}% ${r.approved===true?'· 通過':r.approved===false?'· 未通過':''}</span></div></div>`).join('')}</div>`;}
 function whitelistPanel(p){return p.eligibilityMode!=='whitelist'?'<div class="notice">此投票不是 Email 白名單模式。</div>':`<p class="muted">可直接貼上 Email，或選擇 CSV。CSV 支援欄位 <code>email,name</code>，name 可省略。</p><textarea id="emailsText" placeholder="a@example.com\nb@example.com"></textarea><div class="row"><input id="csvFile" type="file" accept=".csv,text/csv"><button id="importWhitelist" class="primary">匯入白名單</button><button id="loadWhitelist" class="secondary">查看目前名單</button></div><div id="whitelistArea"></div>`;}
