@@ -55,6 +55,10 @@ jobs:
       - name: Install worker deps
         working-directory: worker
         run: npm ci
+      - name: Prepare CI wrangler config
+        # 真實 wrangler.toml 刻意不進 git（.gitignore），CI 以範本做 dry-run 驗證
+        working-directory: worker
+        run: '[ -f wrangler.toml ] || cp wrangler.toml.example wrangler.toml'
       - name: Validate worker (dry-run deploy)
         working-directory: worker
         run: npx wrangler deploy --dry-run --outdir dist
